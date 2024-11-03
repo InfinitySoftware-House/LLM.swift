@@ -3,7 +3,18 @@ import llama
 
 public typealias Token = llama_token
 public typealias Model = OpaquePointer
-public typealias Chat = (role: Role, content: String)
+
+public struct ChatMessage: Identifiable, Equatable, Hashable {
+    public let id = UUID()
+    public let role: Role
+    public var content: String
+    
+    // Public initializer to allow creating instances of ChatMessage outside the module
+    public init(role: Role, content: String) {
+        self.role = role
+        self.content = content
+    }
+}
 
 @globalActor public actor InferenceActor {
     static public let shared = InferenceActor()
@@ -11,8 +22,8 @@ public typealias Chat = (role: Role, content: String)
 
 open class LLM: ObservableObject {
     public var model: Model
-    public var history: [Chat]
-    public var preprocess: (_ input: String, _ history: [Chat]) -> String = { input, _ in return input }
+    public var history: [ChatMessage]
+    public var preprocess: (_ input: String, _ history: [ChatMessage]) -> String = { input, _ in return input }
     public var postprocess: (_ output: String) -> Void                    = { print($0) }
     public var update: (_ outputDelta: String?) -> Void                   = { _ in }
     public var template: Template? = nil {
@@ -41,7 +52,7 @@ open class LLM: ObservableObject {
     public var historyLimit: Int
     public var path: [CChar]
     
-    @Published public private(set) var output = ""    
+    @Published public private(set) var output = ""
     @MainActor public func setOutput(to newOutput: consuming String) {
         output = newOutput
     }
@@ -60,7 +71,7 @@ open class LLM: ObservableObject {
     public init(
         from path: String,
         stopSequence: String? = nil,
-        history: [Chat] = [],
+        history: [ChatMessage] = [],
         seed: UInt32 = .random(in: .min ... .max),
         topK: Int32 = 40,
         topP: Float = 0.95,
@@ -102,7 +113,7 @@ open class LLM: ObservableObject {
     public convenience init(
         from url: URL,
         stopSequence: String? = nil,
-        history: [Chat] = [],
+        history: [ChatMessage] = [],
         seed: UInt32 = .random(in: .min ... .max),
         topK: Int32 = 40,
         topP: Float = 0.95,
@@ -121,13 +132,14 @@ open class LLM: ObservableObject {
             historyLimit: historyLimit,
             maxTokenCount: maxTokenCount
         )
-    } 
+    }
     
     public convenience init(
+        modelId: Int,
         from huggingFaceModel: HuggingFaceModel,
         to url: URL = .documentsDirectory,
         as name: String? = nil,
-        history: [Chat] = [],
+        history: [ChatMessage] = [],
         seed: UInt32 = .random(in: .min ... .max),
         topK: Int32 = 40,
         topP: Float = 0.95,
@@ -136,7 +148,7 @@ open class LLM: ObservableObject {
         maxTokenCount: Int32 = 2048,
         updateProgress: @escaping (Double) -> Void = { print(String(format: "downloaded(%.2f%%)", $0 * 100)) }
     ) async throws {
-        let url = try await huggingFaceModel.download(to: url, as: name) { progress in
+        let url = try await huggingFaceModel.download(modelId: modelId, to: url, as: name) { progress in
             Task { await MainActor.run { updateProgress(progress) } }
         }
         self.init(
@@ -156,7 +168,7 @@ open class LLM: ObservableObject {
     public convenience init(
         from url: URL,
         template: Template,
-        history: [Chat] = [],
+        history: [ChatMessage] = [],
         seed: UInt32 = .random(in: .min ... .max),
         topK: Int32 = 40,
         topP: Float = 0.95,
@@ -194,7 +206,7 @@ open class LLM: ObservableObject {
         llama_sampler_chain_add(sampler, llama_sampler_init_top_p(topP, 1))
         llama_sampler_chain_add(sampler, llama_sampler_init_temp(temp))
         llama_sampler_chain_add(sampler, llama_sampler_init_dist(seed))
-
+        
         let i = batch.n_tokens - 1
         let token = llama_sampler_sample(sampler, context.pointer, i)
         
@@ -331,7 +343,7 @@ open class LLM: ObservableObject {
         let processedInput = preprocess(input, history)
         let response = getResponse(from: processedInput)
         let output = await makeOutputFrom(response)
-        history += [(.user, input), (.bot, output)]
+        history.append(ChatMessage(role: .user, content: input))
         let historyCount = history.count
         if historyLimit < historyCount {
             history.removeFirst(min(2, historyCount))
@@ -353,7 +365,7 @@ open class LLM: ObservableObject {
             return output
         }
     }
-
+    
     private var multibyteCharacter: [CUnsignedChar] = []
     private func decode(_ token: Token) -> String {
         return model.decode(token, with: &multibyteCharacter)
@@ -406,7 +418,7 @@ extension Model {
         multibyteCharacter.removeAll(keepingCapacity: true)
         return decoded
     }
-
+    
     public func encode(_ text: borrowing String) -> [Token] {
         let addBOS = true
         let count = Int32(text.cString(using: .utf8)!.count)
@@ -501,17 +513,17 @@ public struct Template {
         self.shouldDropLast = shouldDropLast
     }
     
-    public var preprocess: (_ input: String, _ history: [Chat]) -> String {
+    public var preprocess: (_ input: String, _ history: [ChatMessage]) -> String {
         return { [self] input, history in
             var processed = prefix
             if let systemPrompt {
                 processed += "\(system.prefix)\(systemPrompt)\(system.suffix)"
             }
-            for chat in history {
-                if chat.role == .user {
-                    processed += "\(user.prefix)\(chat.content)\(user.suffix)"
+            for ChatMessage in history {
+                if ChatMessage.role == .user {
+                    processed += "\(user.prefix)\(ChatMessage.content)\(user.suffix)"
                 } else {
-                    processed += "\(bot.prefix)\(chat.content)\(bot.suffix)"
+                    processed += "\(bot.prefix)\(ChatMessage.content)\(bot.suffix)"
                 }
             }
             processed += "\(user.prefix)\(input)\(user.suffix)"
@@ -626,7 +638,7 @@ public struct HuggingFaceModel {
         let root = "https://huggingface.co"
         return matches.map { match in root + match }
     }
-
+    
     package func getDownloadURL() async throws -> URL? {
         let urlStrings = try await getDownloadURLStrings()
         for urlString in urlStrings {
@@ -636,21 +648,21 @@ public struct HuggingFaceModel {
         return nil
     }
     
-    public func download(to directory: URL = .documentsDirectory, as name: String? = nil, _ updateProgress: @escaping (Double) -> Void) async throws -> URL {
+    public func download(modelId: Int, to directory: URL = .documentsDirectory, as name: String? = nil, _ updateProgress: @escaping (Double) -> Void) async throws -> URL {
         var destination: URL
         if let name {
             destination = directory.appending(path: name)
             guard !destination.exists else { updateProgress(1); return destination }
         }
         guard let downloadURL = try await getDownloadURL() else { throw HuggingFaceError.noFilteredURL }
-        destination = directory.appending(path: downloadURL.lastPathComponent)
+        destination = directory.appending(path: String(modelId) + ".gguf")
         guard !destination.exists else { return destination }
         try await downloadURL.downloadData(to: destination, updateProgress)
         return destination
     }
     
     public static func tinyLLaMA(_ quantization: Quantization = .Q4_K_M, _ systemPrompt: String) -> HuggingFaceModel {
-        HuggingFaceModel("TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF", quantization, template: .chatML(systemPrompt))
+        HuggingFaceModel("TheBloke/TinyLlama-1.1B-ChatMessage-v1.0-GGUF", quantization, template: .chatML(systemPrompt))
     }
 }
 
